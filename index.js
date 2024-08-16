@@ -5,23 +5,22 @@ const port = 3000;
 
 app.use(express.json());
 app.use(cors());
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server is running at http://0.0.0.0:${port}`);
+});
 
+// MongoDB connection and setup
 const { MongoClient } = require('mongodb');
 const url = 'mongodb://127.0.0.1:27017'
 const client = new MongoClient(url);
 client.connect();
+const db = client.db('wordle');
+const collection = db.collection('players');
 
-const word = "apple";
-const words = require('./words');
-
-// the word for testing
-app.get('/word', (req, res) => {
-    console.log('Received request for /word');
-    res.json({ word: word });
-});
+const words = require('./utils/dictionary');
+const { findAndUpdateUser, handleExistingUser, createNewUser, getLeaderboard } = require('./utils/user');
+const { getNewWord, generateGuessResponse, getOrResetCurrentWord } = require('./utils/word');
   
-
-// new user or get user
 app.post('/newOrGetUser', async (req, res) => {
     const { referrerId, userId, name } = req.body;
 
@@ -33,85 +32,22 @@ app.post('/newOrGetUser', async (req, res) => {
         const db = client.db('wordle');
         const collection = db.collection('players');
 
-        let user = await collection.findOne({ TelegramID: userId }, { projection: { CurrentWord: 0 } });
+        // 生成新單詞
+        const newWord = getNewWord();
 
-        if (user) {
-            return res.json(user);
-        } else {
-            let validReferrer = null;
-            if (referrerId) {
-                validReferrer = await collection.findOne({ TelegramID: referrerId });
-            }
+        // 查詢用戶並更新
+        let user = await findAndUpdateUser(collection, userId, newWord);
+        let userData = user ? await handleExistingUser(collection, user) : await createNewUser(collection, userId, name, referrerId);
 
-            const newUser = {
-                TelegramID: userId,
-                Name: name,
-                Rank: 0,
-                PlayCount: 0,
-                Points: 0,
-                Referrer: validReferrer ? referrerId : null,
-                ReferralCount: 0,
-                Referrals: [],
-                CurrentWord: '',
-                CurrentGuesses: []
-            };
+        const leaderboard = await getLeaderboard(collection, userId);
 
-            await collection.insertOne(newUser);
+        return res.json({ user: userData, leaderboard });
 
-            if (validReferrer) {
-                await collection.updateOne(
-                    { TelegramID: referrerId },
-                    { $inc: { ReferralCount: 1 }, $push: { Referrals: userId } }
-                );
-            }
-
-            const { CurrentWord, ...returnUser } = newUser;
-            return res.json(returnUser);
-        }
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: 'Internal server error' });
     }
 });
-
-
-function getNewWord() {
-  const index = Math.floor(Math.random() * words.length);
-  return words[index];
-}
-
-function generateGuessResponse(word, guess) {
-    const letterCount = {};
-    for (const char of word) {
-        if (letterCount[char]) {
-            letterCount[char]++;
-        } else {
-            letterCount[char] = 1;
-        }
-    }
-
-    const response = [];
-    for (let i = 0; i < guess.length; i++) {
-        const guessChar = guess[i];
-        if (guessChar === word[i]) {
-            response.push('o'); // correct
-            letterCount[guessChar]--;
-        } else {
-            response.push('x'); // absent
-        }
-    }
-
-    // 2nd pass to mark present letters
-    for (let i = 0; i < guess.length; i++) {
-        const guessChar = guess[i];
-        if (response[i] === 'x' && word.includes(guessChar) && letterCount[guessChar] > 0) {
-            response[i] = '/'; // present
-            letterCount[guessChar]--;
-        }
-    }
-
-    return response.join('');
-}
 
 app.post('/guess', async (req, res) => {
     const { userId, guess } = req.body;
@@ -121,33 +57,25 @@ app.post('/guess', async (req, res) => {
     }
 
     try {
-        const db = client.db('wordle');
-        const collection = db.collection('players');
         let user = await collection.findOne({ TelegramID: userId });
 
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
         }
 
-        // Ensure the guessed word is in the list
+        // 確保猜測的單字在清單
         if (!words.includes(guess)) {
             return res.status(400).json({ message: 'Invalid guess, word not in the list' });
         }
 
-        // If there is no current word or it's the first attempt, generate a new word
-        if (!user.CurrentWord || user.CurrentWord.length === 0 || user.CurrentGuesses.length === 0) {
-            const newWord = getNewWord();
-            await collection.updateOne(
-                { TelegramID: userId },
-                { $set: { CurrentWord: newWord, CurrentGuesses: [] } }
-            );
-            user.CurrentWord = newWord;
-        }
+        // 取得當前單字
+        const currentWord = await getOrResetCurrentWord(user, collection, userId);
 
-        let response = generateGuessResponse(user.CurrentWord, guess);
-        const correct = user.CurrentWord === guess;
+        // 取得猜測結果
+        const response = generateGuessResponse(currentWord, guess);
+        const correct = currentWord === guess;
 
-        // Update guess history and check the number of attempts
+        // 更新資料庫
         await collection.updateOne(
             { TelegramID: userId },
             { $push: { CurrentGuesses: guess } }
@@ -155,22 +83,12 @@ app.post('/guess', async (req, res) => {
 
         user.CurrentGuesses.push(guess);
 
-        // Check if the guess is correct or if max attempts are reached
-        if (correct) {
-            response = 'ooooo';
-            const newWord = getNewWord();
+        // 檢查是否猜到六次
+        if (correct || user.CurrentGuesses.length >= 6) {
             await collection.updateOne(
                 { TelegramID: userId },
-                { $set: { CurrentWord: newWord, CurrentGuesses: [] } }
+                { $set: { CurrentWord: getNewWord(), CurrentGuesses: [] } }
             );
-        } else if (user.CurrentGuesses.length > 5) {
-            // Game over, reset with a new word
-            const newWord = getNewWord();
-            await collection.updateOne(
-                { TelegramID: userId },
-                { $set: { CurrentWord: newWord, CurrentGuesses: [] } }
-            );
-            return res.json({ result: 'Game over. Max attempts reached.', newWordSet: true });
         }
 
         res.json({ result: response, guess, correct });
@@ -180,6 +98,9 @@ app.post('/guess', async (req, res) => {
     }
 });
 
-app.listen(port, '0.0.0.0', () => {
-  console.log(`Server is running at http://0.0.0.0:${port}`);
-});
+// the word for testing
+// app.get('/word', (req, res) => {
+//     const word = "apple";
+//     console.log('Received request for /word');
+//     res.json({ word: word });
+// });

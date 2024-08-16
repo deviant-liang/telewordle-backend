@@ -18,9 +18,38 @@ const db = client.db('wordle');
 const collection = db.collection('players');
 
 const words = require('./utils/dictionary');
-const { findAndUpdateUser, handleExistingUser, createNewUser, getLeaderboard } = require('./utils/user');
-const { getNewWord, generateGuessResponse, getOrResetCurrentWord } = require('./utils/word');
-  
+const { createNewUser, findUser, getLeaderboard } = require('./utils/user');
+const { getNewWord, generateGuessResponse } = require('./utils/word');
+
+app.post('/newWord', async (req, res) => {
+    const { userId } = req.body;
+
+    if (!userId) {
+        return res.status(400).json({ message: 'UserId is required' });
+    }
+
+    try {
+        // 生成新單字並更新資料庫
+        const newWord = getNewWord();
+        const result = await collection.updateOne(
+            { TelegramID: userId },
+            { $set: { CurrentWord: newWord, CurrentGuesses: [] } }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        // 回傳成功訊息
+        return res.json({ message: 'Word has been reset successfully' });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+});
+
+
 app.post('/newOrGetUser', async (req, res) => {
     const { referrerId, userId, name } = req.body;
 
@@ -28,20 +57,30 @@ app.post('/newOrGetUser', async (req, res) => {
         return res.status(400).json({ message: 'UserId and name are required' });
     }
 
-    try {
-        const db = client.db('wordle');
-        const collection = db.collection('players');
+    try {        
+        // 取得 user
+        let user = await findUser(collection, userId);
+        let userData = user ? user : await createNewUser(collection, userId, name, referrerId);
 
-        // 生成新單詞
         const newWord = getNewWord();
+        await collection.updateOne(
+            { TelegramID: userId },
+            { $set: { CurrentWord: newWord, CurrentGuesses: [] } }
+        );
 
-        // 查詢用戶並更新
-        let user = await findAndUpdateUser(collection, userId, newWord);
-        let userData = user ? await handleExistingUser(collection, user) : await createNewUser(collection, userId, name, referrerId);
+        // 取得 friends
+        let friends = [];
+        if (user && user.Referrals && user.Referrals.length > 0) {
+            friends = await collection.find(
+                { TelegramID: { $in: user.Referrals } },
+                { projection: { Name: 1, Points: 1 } }
+            ).toArray();
+        }
 
+        // 取得 leaderboard
         const leaderboard = await getLeaderboard(collection, userId);
 
-        return res.json({ user: userData, leaderboard });
+        return res.json({ user: userData, friends, leaderboard });
 
     } catch (err) {
         console.error(err);
@@ -63,13 +102,13 @@ app.post('/guess', async (req, res) => {
             return res.status(404).json({ message: 'User not found' });
         }
 
-        // 確保猜測的單字在清單
+        // 對照單字列表
         if (!words.includes(guess)) {
             return res.status(400).json({ message: 'Invalid guess, word not in the list' });
         }
 
         // 取得當前單字
-        const currentWord = await getOrResetCurrentWord(user, collection, userId);
+        const currentWord = user.CurrentWord;
 
         // 取得猜測結果
         const response = generateGuessResponse(currentWord, guess);
@@ -83,20 +122,34 @@ app.post('/guess', async (req, res) => {
 
         user.CurrentGuesses.push(guess);
 
-        // 檢查是否猜到六次
+        // 猜對時增加積分
+        let pointsEarned = 0;
+        if (correct) {
+            pointsEarned = Math.max(25 - user.CurrentGuesses.length * 3, 1); // 根據猜測次數給分
+            await collection.updateOne(
+                { TelegramID: userId },
+                { $inc: { Points: pointsEarned } }
+            );
+        }
+
+        let responseData = { result: response, guess, correct, pointsEarned };
+
+        // 正確或猜六次都沒對
         if (correct || user.CurrentGuesses.length >= 6) {
+            responseData.correctWord = currentWord; // 回傳正確單字
             await collection.updateOne(
                 { TelegramID: userId },
                 { $set: { CurrentWord: getNewWord(), CurrentGuesses: [] } }
             );
         }
 
-        res.json({ result: response, guess, correct });
+        res.json(responseData);
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Server error' });
     }
 });
+
 
 // the word for testing
 // app.get('/word', (req, res) => {

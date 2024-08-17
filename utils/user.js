@@ -41,10 +41,10 @@ async function findUser(collection, userId) {
 
 // 取得排行榜
 async function getLeaderboard(collection, userId) {
-    // 取得前10
+    // 取得前100
     const topUsers = await collection.find({}, { projection: { Name: 1, Points: 1, _id: 0 } })
         .sort({ Points: -1 })
-        .limit(10)
+        .limit(100)
         .toArray();
 
     // 標示排名
